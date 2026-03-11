@@ -1,6 +1,12 @@
 ---
 name: browser-agent
-description: Controls Chrome browser via the DevTools Protocol from the terminal. Navigates pages, clicks elements, fills forms, extracts text, takes screenshots, saves PDFs, runs JavaScript, manages cookies and storage, emulates devices, monitors network, and automates any web task. Use when user asks to open a webpage, scrape a site, get a YouTube transcript, fill out a form, take a screenshot, click through a web UI, search page content, save as PDF, run JS on page, check cookies, emulate mobile, or automate browser interactions. Trigger phrases include browse to, open this URL, get page content, screenshot this site, scrape website, extract transcript, fill this form, click the button, web automation, save as PDF, run javascript, check cookies, emulate iPhone.
+description: >
+  Automate Chrome from the terminal via DevTools Protocol. Use when user asks to open a webpage,
+  scrape a site, get a YouTube transcript, fill out a form, take a screenshot, click through a web UI,
+  save as PDF, run JavaScript on a page, check cookies/storage, emulate mobile devices, or monitor network.
+  Covers any browser interaction — navigating, clicking, typing, scrolling, extracting text, and more.
+  Trigger phrases: "browse to", "open this URL", "screenshot this site", "scrape website",
+  "extract transcript", "web automation", "emulate iPhone".
 compatibility: Requires Bun runtime and Google Chrome installed. macOS or Linux.
 metadata:
   version: 0.3.0
