@@ -524,10 +524,54 @@ async function cmdList(runtime) {
 async function cmdOpen(runtime, commandArgs) {
   const args = [...commandArgs];
   const newTab = takeFlag(args, ["--new-tab", "-n"]);
+  const parallel = takeFlag(args, ["--parallel", "-p"]);
   const tabTarget = takeOption(args, ["--tab", "-t"]);
+  if (parallel) {
+    const urls = args.filter((a) => !a.startsWith("-"));
+    if (urls.length === 0)
+      die("Usage: browser.js open <url1> <url2> ... --parallel");
+    const results = await Promise.allSettled(urls.map(async (rawUrl2) => {
+      const url2 = normalizeUrl(rawUrl2);
+      const wsUrl = await getBrowserWsUrl(runtime.cdpUrl);
+      const browser = await CDP.connect(wsUrl, runtime.timeoutMs);
+      try {
+        const { targetId } = await browser.send("Target.createTarget", { url: url2 });
+        await new Promise((r) => setTimeout(r, 500));
+        const pages = await getPages(runtime.cdpUrl);
+        const page = pages.find((p) => p.id === targetId);
+        if (page) {
+          const client = await CDP.connect(page.webSocketDebuggerUrl, runtime.timeoutMs);
+          try {
+            await waitForLoad(client, runtime.timeoutMs);
+            const titleRes = await client.send("Runtime.evaluate", {
+              expression: "document.title || '(no title)'",
+              returnByValue: true
+            });
+            return { idx: pages.indexOf(page), title: titleRes?.result?.value, url: page.url || url2 };
+          } finally {
+            client.close();
+          }
+        }
+        return { idx: "?", title: "(loading...)", url: url2 };
+      } finally {
+        browser.close();
+      }
+    }));
+    for (const r of results) {
+      if (r.status === "fulfilled") {
+        console.log(`[${r.value.idx}] ${r.value.title}`);
+        console.log(`    ${r.value.url}`);
+      } else {
+        console.error(`Error: ${r.reason?.message || r.reason}`);
+      }
+    }
+    console.log(`
+Opened ${results.filter((r) => r.status === "fulfilled").length}/${urls.length} tabs in parallel.`);
+    return;
+  }
   const rawUrl = args[0];
   if (!rawUrl)
-    die("Usage: browser.js open <url> [--new-tab] [--tab <index>]");
+    die("Usage: browser.js open <url> [--new-tab] [--tab <index>] [--parallel]");
   if (newTab && tabTarget !== undefined)
     die("Use --new-tab or --tab, not both.");
   const url = normalizeUrl(rawUrl);
@@ -1475,6 +1519,50 @@ Custom: browser.js emulate 375x812 [--dpr 3] [--mobile] [--ua "..."]`);
     console.log(`Emulating ${width}x${height} @${dpr}x${mobile ? " (mobile)" : ""}`);
   });
 }
+async function cmdParallel(runtime, commandArgs) {
+  const cmds = commandArgs.filter((a) => a.trim());
+  if (cmds.length === 0) {
+    die(`Usage: browser.js parallel "cmd1 [args]" "cmd2 [args]" ...
+` + 'Example: parallel "content 0" "content 1" "screenshot 2 -o shot.png"');
+  }
+  const scriptPath = import.meta.filename;
+  const globalArgs = [];
+  if (runtime.cdpUrl !== BASE_URL)
+    globalArgs.push("--cdp-url", runtime.cdpUrl);
+  if (runtime.timeoutMs !== TIMEOUT)
+    globalArgs.push("--timeout-ms", String(runtime.timeoutMs));
+  const t0 = Date.now();
+  const results = await Promise.allSettled(cmds.map(async (cmdStr) => {
+    const parts = cmdStr.trim().split(/\s+/);
+    const proc = Bun.spawn(["bun", scriptPath, ...globalArgs, ...parts], {
+      stdout: "pipe",
+      stderr: "pipe"
+    });
+    const [stdout, stderr, code] = await Promise.all([
+      new Response(proc.stdout).text(),
+      new Response(proc.stderr).text(),
+      proc.exited
+    ]);
+    return { cmdStr, stdout: stdout.trim(), stderr: stderr.trim(), code };
+  }));
+  const elapsed = Date.now() - t0;
+  for (const r of results) {
+    if (r.status === "fulfilled") {
+      const { cmdStr, stdout, stderr, code } = r.value;
+      console.log(`\u2500\u2500 ${cmdStr}${code !== 0 ? " [FAILED]" : ""} \u2500\u2500`);
+      if (stdout)
+        console.log(stdout);
+      if (stderr)
+        console.error(stderr);
+    } else {
+      console.log(`\u2500\u2500 (spawn error) \u2500\u2500`);
+      console.error(r.reason?.message || String(r.reason));
+    }
+    console.log();
+  }
+  const ok = results.filter((r) => r.status === "fulfilled" && r.value.code === 0).length;
+  console.log(`${ok}/${cmds.length} commands completed in ${elapsed}ms`);
+}
 var HELP = `
 browser-agent \u2014 Chrome automation CLI via DevTools Protocol
 
@@ -1484,6 +1572,7 @@ Usage:
 Tab & Navigation:
   list                               List open tabs.
   open <url> [--new-tab] [--tab N]   Open a URL.
+  open <u1> <u2> ... --parallel      Open multiple URLs in new tabs concurrently.
   close <tab|all>                    Close tabs.
   back [tab]                         Go back in history.
   forward [tab]                      Go forward in history.
@@ -1516,6 +1605,10 @@ Browser State:
   console [tab] [--duration ms]      Capture console logs.
   network [tab] [--duration ms] [--filter str]   Monitor network requests.
   emulate <device|WxH|reset> [--dpr N] [--mobile]  Device emulation.
+
+Parallel:
+  parallel "cmd1" "cmd2" ...         Run multiple commands concurrently.
+    Example: parallel "content 0" "content 1" "screenshot 2 -o s.png"
 
 Global options:
   --cdp-url <url>    CDP endpoint (default: ${BASE_URL})
@@ -1596,6 +1689,8 @@ async function main() {
       return cmdNetwork(runtime, args);
     case "emulate":
       return cmdEmulate(runtime, args);
+    case "parallel":
+      return cmdParallel(runtime, args);
     default:
       die(`Unknown command "${command}". Use --help for usage.`);
   }
