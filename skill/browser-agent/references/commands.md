@@ -22,6 +22,7 @@ bash ~/.claude/skills/browser-agent/scripts/start-chrome.sh [--kill-existing] [-
 | `open URL` | Navigate tab 0 to the given URL |
 | `open URL --new-tab` | Open URL in a new tab |
 | `open URL --tab N` | Navigate a specific tab to the URL |
+| `open URL1 URL2 ... --parallel` | Open multiple URLs in new tabs concurrently |
 | `close N` | Close tab at index N |
 | `close all` | Close every open tab |
 | `back [tab]` | Go back in browser history |
@@ -123,6 +124,17 @@ bash ~/.claude/skills/browser-agent/scripts/start-chrome.sh [--kill-existing] [-
 | `PageUp`, `PageDown` | |
 | `F1` through `F12` | |
 | Any single character | e.g., `a`, `1`, `/` |
+
+## Parallel Execution
+
+| Command | Description |
+|---|---|
+| `parallel "cmd1 args" "cmd2 args" ...` | Run multiple commands concurrently. Each command runs in its own subprocess. Output is grouped by command. |
+
+**Examples:**
+- `parallel "content 0" "content 1" "content 2"` — read 3 tabs at once
+- `parallel "screenshot 0 -o a.png" "screenshot 1 -o b.png"` — screenshot 2 tabs at once
+- `parallel "open https://a.com --tab 0" "open https://b.com --tab 1"` — navigate 2 tabs simultaneously
 
 ## Global Flags
 

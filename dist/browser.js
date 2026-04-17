@@ -184,9 +184,13 @@ var INTERACTIVE_SELECTOR = [
   "[contenteditable='']",
   "summary"
 ].join(",");
-function elementsScript() {
+function elementsScript(opts = {}) {
+  const viewportOnly = !!opts.viewportOnly;
+  const withinSelector = opts.within || "";
   return `(() => {
     const SELECTOR = ${JSON.stringify(INTERACTIVE_SELECTOR)};
+    const VIEWPORT_ONLY = ${JSON.stringify(viewportOnly)};
+    const WITHIN_SEL = ${JSON.stringify(withinSelector)};
 
     const normalize = v => (v || "").replace(/\\s+/g, " ").trim();
 
@@ -227,25 +231,48 @@ function elementsScript() {
       return parts.join(" > ");
     };
 
+    // Compute viewport bounds once. An element is "in viewport" if it overlaps the visible window.
+    const vw = window.innerWidth || document.documentElement.clientWidth || 0;
+    const vh = window.innerHeight || document.documentElement.clientHeight || 0;
+    const inViewport = el => {
+      const r = el.getBoundingClientRect();
+      return r.bottom > 0 && r.right > 0 && r.top < vh && r.left < vw;
+    };
+
+    // Optional "within" scope: restrict candidates to descendants of a CSS selector match.
+    // We don't throw if the selector matches nothing — just return [].
+    let scope = null;
+    if (WITHIN_SEL) {
+      try { scope = document.querySelector(WITHIN_SEL); } catch { scope = null; }
+      if (!scope) return { items: [], totalBeforeFilter: 0, filterInfo: { within: WITHIN_SEL, matched: false } };
+    }
+
+    // IMPORTANT: indices are assigned from the FULL visible/dedupe pipeline so that
+    // click/hover by index stays consistent regardless of display filters.
+    // Filters only hide items from the output — they do NOT renumber.
     const out = [];
     const seen = new Set();
+    let absIdx = 0;
     for (const raw of document.querySelectorAll(SELECTOR)) {
       if (!(raw instanceof HTMLElement) || !isVisible(raw) || isDisabled(raw)) continue;
       const sel = selector(raw);
       if (seen.has(sel)) continue;
       seen.add(sel);
+      const myIdx = absIdx++;
+      if (scope && !scope.contains(raw)) continue;
+      if (VIEWPORT_ONLY && !inViewport(raw)) continue;
       const lbl = label(raw) || "(no label)";
       out.push({
-        index: out.length,
+        index: myIdx,
         tag: raw.tagName.toLowerCase(),
         type: raw.getAttribute("type") || "",
         role: raw.getAttribute("role") || "",
         label: lbl.length > 140 ? lbl.slice(0, 137) + "..." : lbl,
         selector: sel,
       });
-      if (out.length >= 500) break;
+      if (absIdx >= 500) break;
     }
-    return out;
+    return { items: out, totalBeforeFilter: absIdx, filterInfo: { viewportOnly: VIEWPORT_ONLY, within: WITHIN_SEL || null } };
   })()`;
 }
 function clickByIndexScript(targetIndex) {
@@ -266,9 +293,34 @@ function clickByIndexScript(targetIndex) {
       el.innerText || el.textContent || el.getAttribute("aria-label") ||
       el.getAttribute("title") || el.getAttribute("name") || el.getAttribute("value") || el.id
     );
+    const selectorFor = el => {
+      if (el.id) return "#" + CSS.escape(el.id);
+      const parts = [];
+      let node = el, depth = 0;
+      while (node && node instanceof HTMLElement && depth < 6) {
+        let part = node.tagName.toLowerCase();
+        if (node.classList.length > 0) part += "." + CSS.escape(node.classList.item(0));
+        const siblings = node.parentElement
+          ? Array.from(node.parentElement.children).filter(s => s.tagName === node.tagName) : [];
+        if (siblings.length > 1) part += ":nth-of-type(" + (siblings.indexOf(node) + 1) + ")";
+        parts.unshift(part);
+        node = node.parentElement;
+        depth++;
+      }
+      return parts.join(" > ");
+    };
 
-    const nodes = Array.from(document.querySelectorAll(SELECTOR))
-      .filter(n => n instanceof HTMLElement && isVisible(n) && !isDisabled(n));
+    // Must match elementsScript() pipeline exactly, or indices drift.
+    const nodes = [];
+    const seen = new Set();
+    for (const raw of document.querySelectorAll(SELECTOR)) {
+      if (!(raw instanceof HTMLElement) || !isVisible(raw) || isDisabled(raw)) continue;
+      const sel = selectorFor(raw);
+      if (seen.has(sel)) continue;
+      seen.add(sel);
+      nodes.push(raw);
+      if (nodes.length >= 500) break;
+    }
 
     if (!Number.isInteger(target) || target < 0 || target >= nodes.length) {
       return { ok: false, reason: "Index " + target + " out of range (0-" + Math.max(0, nodes.length - 1) + ")." };
@@ -428,6 +480,37 @@ function takeOption(args, names) {
   }
   return;
 }
+function tokenizeShellArgs(str) {
+  const out = [];
+  let cur = "";
+  let quote = null;
+  let hasCur = false;
+  for (let i = 0; i < str.length; i++) {
+    const c = str[i];
+    if (quote) {
+      if (c === "\\" && i + 1 < str.length && (str[i + 1] === quote || str[i + 1] === "\\")) {
+        cur += str[i + 1];
+        hasCur = true;
+        i++;
+      } else if (c === quote) {
+        quote = null;
+      } else {
+        cur += c;
+        hasCur = true;
+      }
+    } else if (c === '"' || c === "'") {
+      quote = c;
+      hasCur = true;
+    } else if (/\s/.test(c)) {
+      if (hasCur) { out.push(cur); cur = ""; hasCur = false; }
+    } else {
+      cur += c;
+      hasCur = true;
+    }
+  }
+  if (hasCur) out.push(cur);
+  return out;
+}
 function elementCenterScript(target) {
   const isNumeric = /^\d+$/.test(String(target).trim());
   if (isNumeric) {
@@ -441,8 +524,32 @@ function elementCenterScript(target) {
         return r.width > 0 && r.height > 0;
       };
       const isDisabled = el => el.matches(":disabled, [aria-disabled='true'], [inert]");
-      const nodes = Array.from(document.querySelectorAll(SELECTOR))
-        .filter(n => n instanceof HTMLElement && isVisible(n) && !isDisabled(n));
+      const selectorFor = el => {
+        if (el.id) return "#" + CSS.escape(el.id);
+        const parts = [];
+        let node = el, depth = 0;
+        while (node && node instanceof HTMLElement && depth < 6) {
+          let part = node.tagName.toLowerCase();
+          if (node.classList.length > 0) part += "." + CSS.escape(node.classList.item(0));
+          const siblings = node.parentElement
+            ? Array.from(node.parentElement.children).filter(s => s.tagName === node.tagName) : [];
+          if (siblings.length > 1) part += ":nth-of-type(" + (siblings.indexOf(node) + 1) + ")";
+          parts.unshift(part);
+          node = node.parentElement;
+          depth++;
+        }
+        return parts.join(" > ");
+      };
+      const nodes = [];
+      const seen = new Set();
+      for (const raw of document.querySelectorAll(SELECTOR)) {
+        if (!(raw instanceof HTMLElement) || !isVisible(raw) || isDisabled(raw)) continue;
+        const sel = selectorFor(raw);
+        if (seen.has(sel)) continue;
+        seen.add(sel);
+        nodes.push(raw);
+        if (nodes.length >= 500) break;
+      }
       const idx = ${JSON.stringify(Number(target))};
       if (idx < 0 || idx >= nodes.length) return null;
       const el = nodes[idx];
@@ -628,25 +735,46 @@ async function cmdHtml(runtime, commandArgs) {
 async function cmdElements(runtime, commandArgs) {
   const args = [...commandArgs];
   const asJson = takeFlag(args, ["--json"]);
+  const verbose = takeFlag(args, ["--verbose", "-v"]);
+  const viewportOnly = takeFlag(args, ["--viewport-only", "--viewport"]);
+  const within = takeOption(args, ["--within"]);
   const tabArg = args[0] ?? "0";
   await withPage(runtime.cdpUrl, tabArg, runtime.timeoutMs, async ({ client }) => {
     const res = await client.send("Runtime.evaluate", {
-      expression: elementsScript(),
+      expression: elementsScript({ viewportOnly, within }),
       returnByValue: true
     });
-    const elements = res?.result?.value || [];
+    const payload = res?.result?.value || { items: [], totalBeforeFilter: 0, filterInfo: {} };
+    const elements = payload.items || [];
     if (asJson) {
+      // Backward-compatible JSON: keep the array shape at the root, but add a second line with meta when a filter was applied.
       console.log(JSON.stringify(elements, null, 2));
+      if (viewportOnly || within) {
+        console.error(JSON.stringify({ totalBeforeFilter: payload.totalBeforeFilter, filter: payload.filterInfo }));
+      }
+      return;
+    }
+    if (within && payload.filterInfo && payload.filterInfo.matched === false) {
+      console.log(`No element matched --within "${within}".`);
       return;
     }
     if (elements.length === 0) {
-      console.log("No interactive elements found.");
+      const hint = (viewportOnly || within)
+        ? ` (${payload.totalBeforeFilter} interactive elements exist off-scope — drop filters to see them)`
+        : "";
+      console.log(`No interactive elements found${hint}.`);
       return;
     }
+    // Default text output: dense, no CSS selector (LLM addresses elements by index).
+    // Use --verbose to also print the selector for manual debugging.
     for (const el of elements) {
       const type = el.type ? `:${el.type}` : "";
       const role = el.role ? ` role=${el.role}` : "";
-      console.log(`[${el.index}] <${el.tag}${type}> "${el.label}"${role} ${el.selector}`);
+      const tail = verbose ? ` ${el.selector}` : "";
+      console.log(`[${el.index}] <${el.tag}${type}> "${el.label}"${role}${tail}`);
+    }
+    if (viewportOnly || within) {
+      console.log(`(${elements.length} shown / ${payload.totalBeforeFilter} total interactive elements)`);
     }
   });
 }
@@ -1327,53 +1455,46 @@ async function cmdConsole(runtime, commandArgs) {
   const args = [...commandArgs];
   const duration = Number(takeOption(args, ["--duration", "-d"]) ?? "5000");
   const tabArg = args[0] ?? "0";
-  await withPage(runtime.cdpUrl, tabArg, runtime.timeoutMs, async ({ client }) => {
+  await withPage(runtime.cdpUrl, tabArg, runtime.timeoutMs + duration, async ({ client }) => {
     await client.send("Runtime.enable");
-    const logs = [];
-    const origOnMessage = client._onMessage;
-    const origWs = client;
-    const messageHandler = (event) => {
-      try {
-        const msg = JSON.parse(typeof event.data === "string" ? event.data : event.data.toString());
-        if (msg.method === "Runtime.consoleAPICalled") {
-          const entry = msg.params;
-          const text = (entry.args || []).map((a) => a.value !== undefined ? String(a.value) : a.description || a.type).join(" ");
-          logs.push(`[${entry.type}] ${text}`);
+    // Install interceptor BEFORE waiting so the current duration window actually captures messages.
+    // Drain any buffered logs from a previous run on the same tab so the output is not stale.
+    await client.send("Runtime.evaluate", {
+      expression: `(() => {
+        if (!window.__browserAgentConsoleInstalled) {
+          window.__browserAgentConsoleInstalled = true;
+          window.__browserAgentConsoleLogs = [];
+          const orig = {};
+          for (const m of ['log', 'warn', 'error', 'info', 'debug']) {
+            orig[m] = console[m];
+            console[m] = function(...args) {
+              try {
+                window.__browserAgentConsoleLogs.push('[' + m + '] ' + args.map(a => {
+                  try { return typeof a === 'string' ? a : JSON.stringify(a); } catch { return String(a); }
+                }).join(' '));
+                if (window.__browserAgentConsoleLogs.length > 500) window.__browserAgentConsoleLogs.shift();
+              } catch {}
+              orig[m].apply(console, args);
+            };
+          }
         }
-      } catch {}
-    };
+        // Drain previously buffered messages so we only show what lands during this duration window.
+        if (Array.isArray(window.__browserAgentConsoleLogs)) window.__browserAgentConsoleLogs.length = 0;
+      })()`,
+      returnByValue: true
+    });
     console.log(`Listening for console messages for ${duration}ms...`);
     await new Promise((r) => setTimeout(r, duration));
     const res = await client.send("Runtime.evaluate", {
       expression: `(() => {
         if (!window.__browserAgentConsoleLogs) return [];
-        const logs = window.__browserAgentConsoleLogs.splice(0);
-        return logs;
+        return window.__browserAgentConsoleLogs.splice(0);
       })()`,
       returnByValue: true
     });
-    await client.send("Runtime.evaluate", {
-      expression: `(() => {
-        if (window.__browserAgentConsoleInstalled) return;
-        window.__browserAgentConsoleInstalled = true;
-        window.__browserAgentConsoleLogs = [];
-        const orig = {};
-        for (const m of ['log', 'warn', 'error', 'info', 'debug']) {
-          orig[m] = console[m];
-          console[m] = function(...args) {
-            window.__browserAgentConsoleLogs.push('[' + m + '] ' + args.map(String).join(' '));
-            if (window.__browserAgentConsoleLogs.length > 500) window.__browserAgentConsoleLogs.shift();
-            orig[m].apply(console, args);
-          };
-        }
-      })()`,
-      returnByValue: true
-    });
-    const stored = res?.result?.value || [];
-    const all = [...stored.map(String), ...logs];
+    const all = (res?.result?.value || []).map(String);
     if (all.length === 0) {
-      console.log("No console messages captured.");
-      console.log("Hint: Console interceptor is now installed. Run `console` again to capture new messages.");
+      console.log("No console messages captured during the window.");
     } else {
       for (const line of all)
         console.log(line);
@@ -1533,7 +1654,7 @@ async function cmdParallel(runtime, commandArgs) {
     globalArgs.push("--timeout-ms", String(runtime.timeoutMs));
   const t0 = Date.now();
   const results = await Promise.allSettled(cmds.map(async (cmdStr) => {
-    const parts = cmdStr.trim().split(/\s+/);
+    const parts = tokenizeShellArgs(cmdStr.trim());
     const proc = Bun.spawn(["bun", scriptPath, ...globalArgs, ...parts], {
       stdout: "pipe",
       stderr: "pipe"
@@ -1581,7 +1702,9 @@ Tab & Navigation:
 Reading:
   content [tab]                      Print visible page text.
   html [tab]                         Print raw HTML.
-  elements [tab] [--json]            List interactive elements.
+  elements [tab] [--json] [--verbose] [--viewport-only] [--within css]
+                                     List interactive elements. Indices are absolute
+                                     (filters hide items but do not renumber).
   search <query>                     Search across tabs.
   eval [tab] <js>                    Execute JavaScript and print result.
 

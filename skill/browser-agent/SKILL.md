@@ -9,7 +9,7 @@ description: >
   "extract transcript", "web automation", "emulate iPhone".
 compatibility: Requires Bun runtime and Google Chrome installed. macOS or Linux.
 metadata:
-  version: 0.3.0
+  version: 0.5.0
   category: browser-automation
   tags: [chrome, cdp, devtools, web-scraping, screenshots, browser, pdf, cookies, emulation, network]
 ---
@@ -36,17 +36,45 @@ curl -sf http://127.0.0.1:9222/json/version >/dev/null 2>&1 || bash ~/.claude/sk
 
 Run this single command at the start of every browser task. It is a no-op if Chrome is already running, and starts it otherwise. Wait for "Chrome launched" confirmation if it starts Chrome.
 
-## Step 2: Follow the Navigate-Observe-Act-Verify Loop
+## Step 2: Recon-First Pattern (preferred)
 
-For every browser task, repeat this cycle:
+Instead of scanning after every action, **recon once, then execute multiple steps in sequence**:
 
-1. **Navigate**: `open "https://example.com"` to load a page
-2. **Observe**: `content` to read text, `elements` to list interactive elements, or `screenshot` to see the visual state
-3. **Act**: `click` a button/link, `type` into an input, `keypress` for keyboard shortcuts, `select` for dropdowns
-4. **Verify**: `screenshot` or `content` to confirm the action succeeded
-5. **Repeat** until the task is complete
+1. **Navigate**: `open "https://example.com"`
+2. **Recon**: run `elements` once to map all interactive indices + `content` for text context. Keep this map in mind.
+3. **Plan**: decide the sequence of clicks/types/keypresses needed (e.g., "click search box → type query → press Enter → click result #3").
+4. **Execute**: run the planned commands back-to-back without re-scanning between each.
+5. **Re-recon only on DOM change**: after a navigation, page transition, modal open/close, or when a click visibly changes layout, run `elements` again. Small state changes (typing in an input, hovering) do NOT invalidate indices.
+6. **Verify at the end**: `screenshot` or `content` once the flow completes.
 
-CRITICAL: Always re-run `elements` after any navigation or click. Element indices change when the DOM updates.
+Rule of thumb: if the URL did not change and no new major section appeared, the previous `elements` output is still valid. This matches how the "surf-agent" approach speeds up multi-step flows — one recon feeds many actions.
+
+### When to fall back to Navigate-Observe-Act-Verify
+
+Use the slower step-by-step loop when:
+- The page is a heavy SPA where clicks swap large subtrees (re-recon each time).
+- Indices keep failing (the DOM is unstable — re-scan before every action).
+- You are debugging an unexpected failure.
+
+CRITICAL: indices from `elements` are only valid against the snapshot they came from. If `click` by index fails, the DOM has shifted — re-run `elements` before retrying.
+
+## Step 3: Leveraging Logged-In Sessions
+
+This skill drives the user's real Chrome profile. That means **any site the user is already logged into works without API keys or OAuth**:
+
+- Gmail, Google Sheets, Google Drive, Calendar — no API setup
+- Discord, Slack, X/Twitter, LinkedIn — no developer tokens
+- GitHub, internal dashboards, SaaS tools behind SSO — just navigate
+
+Prefer browser automation over building API integrations when:
+- The task is one-off or exploratory (research, recon, scraping)
+- The user has a session and the API would require OAuth / billing / scopes
+- The action is trivially scriptable in the UI (fill form, click button, read a panel)
+
+Prefer APIs when:
+- The task runs headless/scheduled (this skill is NOT headless)
+- Volume is high enough that browser latency matters
+- A proper audit trail / rate limit is needed
 
 ## Commands
 
@@ -54,6 +82,7 @@ CRITICAL: Always re-run `elements` after any navigation or click. Element indice
 
 - `list` -- list all open tabs
 - `open URL` -- navigate tab 0 to URL. Use `--new-tab` for a new tab, `--tab N` for a specific tab.
+- `open URL1 URL2 URL3 --parallel` -- open multiple URLs in new tabs concurrently. All tabs load at the same time.
 - `close N` or `close all` -- close tabs
 - `back [tab]` -- go back in browser history
 - `forward [tab]` -- go forward in browser history
@@ -63,7 +92,12 @@ CRITICAL: Always re-run `elements` after any navigation or click. Element indice
 
 - `content [tab]` -- get visible text content
 - `html [tab]` -- get raw HTML source
-- `elements [tab]` -- list interactive elements with clickable indices. Add `--json` for structured output.
+- `elements [tab]` -- list interactive elements with clickable indices. Flags:
+  - `--json` for structured output (includes the CSS `selector` field).
+  - `--verbose` / `-v` to also print the CSS selector in text output (off by default to save tokens).
+  - `--viewport-only` to show only elements currently visible in the viewport.
+  - `--within "css-selector"` to restrict the listing to descendants of a scope element.
+  - Indices are **absolute**: filters hide items but never renumber. `click N` stays consistent whether or not filters are active.
 - `search "query"` -- full-text search across all open tabs
 - `eval [tab] "javascript"` -- execute arbitrary JavaScript and print the result. Alias: `js`.
 
@@ -98,11 +132,24 @@ CRITICAL: Always re-run `elements` after any navigation or click. Element indice
 - `network [tab] --duration 5000` -- monitor network requests for N milliseconds. Add `--filter "api"` to filter by URL.
 - `emulate DEVICE` -- emulate a device. Presets: `iphone-14`, `iphone-15-pro`, `ipad`, `pixel-7`, `desktop-hd`, `desktop-4k`. Custom: `emulate 375x812 --dpr 3 --mobile`. Use `emulate reset` to clear.
 
+### Parallel Execution
+
+- `parallel "cmd1" "cmd2" "cmd3"` -- run multiple commands concurrently on different tabs. Each command runs in its own process for clean output isolation. Results are grouped by command.
+
 Tab index defaults to 0 if omitted. Use `list` to see current tab indices.
 
 For full command details with all flags, consult `references/commands.md`.
 
 ## Examples
+
+### Parallel research: open 3 sites and extract text from all at once
+
+```bash
+# Open multiple sites in parallel
+bun ~/.claude/skills/browser-agent/scripts/browser.js open "https://site1.com" "https://site2.com" "https://site3.com" --parallel
+# Read all tabs at once
+bun ~/.claude/skills/browser-agent/scripts/browser.js parallel "content 0" "content 1" "content 2"
+```
 
 ### Extract text from a webpage
 
